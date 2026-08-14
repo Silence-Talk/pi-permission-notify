@@ -25,19 +25,25 @@ Listens to the `permissions:ui_prompt` event from pi-permission-system and forwa
 
 ### Remote-approval (opt-in)
 
-Hooks pi's `tool_call` event for `bash` commands. When the agent runs a shell command, the extension sends a Telegram message with inline keyboard buttons:
+Hooks pi's `tool_call` event for `bash` commands. When the agent runs a shell command, the extension shows the approval prompt on **two surfaces in parallel** and lets whichever you respond to first win:
 
-```
-⏳ Approve command?
-```
-```bash
-echo "hello world"
-```
-[✅ Approve]  [❌ Deny]
+1. **Telegram** — a message with inline keyboard buttons:
+   ```
+   ⏳ Approve command?
+   ```
+   ```bash
+   echo "hello world"
+   ```
+   [✅ Approve]  [❌ Deny]
 
-- **Tap ✅ Approve** → message edits to "✅ Approved", command runs
-- **Tap ❌ Deny** → message edits to "❌ Denied", command blocked with reason "Denied via Telegram"
-- **No tap for 2 minutes** → message edits to "⏱️ Timed out — denied", command blocked (fail-closed)
+2. **TUI** — a `confirm` dialog in the pi terminal
+
+This dual-surface design means approval works even when Telegram isn't connected yet (e.g. right after pi starts, before the bot polling loop is ready). Answer from whichever surface is convenient:
+
+- **Tap ✅ Approve** (Telegram) or confirm in TUI → message edits to "✅ Approved", command runs
+- **Tap ❌ Deny** (Telegram) or cancel in TUI → message edits to "❌ Denied", command blocked
+- **No response for 2 minutes** → message edits to "⏱️ Timed out — denied", command blocked (fail-closed)
+- **Both surfaces unavailable** (no Telegram + no TUI, e.g. headless) → command denied fail-closed
 
 ## Requirements
 

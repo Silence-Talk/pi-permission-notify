@@ -183,11 +183,11 @@ export default function piPermissionNotifyExtension(pi: ExtensionAPI): void {
       const command: string = event?.input?.command;
       if (!command || typeof command !== "string") return;
 
-      // Don't double-gate trivial/echo commands; let the permission system handle those.
-      // (This is the extension's own approval layer for non-trivial bash.)
-
       const id = shortId();
-      const handle = await send(
+      let settled = false;
+
+      // ── Surface 1: Telegram inline keyboard ──
+      const tgHandle = await send(
         { text: fmtBash(command), parseMode: "markdown", replyMarkup: {
           inline_keyboard: [[
             { text: "✅ Approve", callback_data: `${NS}:approve:${id}` },
@@ -197,18 +197,62 @@ export default function piPermissionNotifyExtension(pi: ExtensionAPI): void {
         { scope: { kind: "instance" } },
       );
 
-      const promise = new Promise<"allow" | "deny">((resolve) => {
+      const tgPromise = new Promise<"allow" | "deny" | null>((resolve) => {
+        // null = no Telegram surface available (not connected / delivery failed)
+        if (!tgHandle) return resolve(null);
         const timer = setTimeout(() => {
+          if (settled) return;
           pending.delete(id);
-          void edit(handle, "⏱️ Timed out — denied");
+          void edit(tgHandle, "⏱️ Timed out — denied");
           resolve("deny");
         }, APPROVAL_TIMEOUT_MS);
-        pending.set(id, { resolve, timer, handle });
+        pending.set(id, {
+          resolve: (d) => { if (!settled) resolve(d); },
+          timer, handle: tgHandle,
+        });
       });
 
-      const decision = await promise;
+      // ── Surface 2: TUI confirm dialog ──
+      // Shown in parallel so approval works even when Telegram isn't
+      // connected yet (e.g. at bootup). Falls back gracefully if no UI.
+      const tuiPromise: Promise<"allow" | "deny" | null> = (async () => {
+        if (!ctx?.hasUI || typeof ctx?.ui?.confirm !== "function") return null;
+        try {
+          const ok = await ctx.ui.confirm("Bash approval required", command);
+          return ok ? "allow" : "deny";
+        } catch {
+          return null; // dialog dismissed/cancelled — let Telegram decide
+        }
+      })();
+
+      // ── Race: first surface to answer wins ──
+      const decision = await new Promise<"allow" | "deny">((resolve) => {
+        let done = false;
+        const finish = (d: "allow" | "deny" | null) => {
+          if (done || !d) return;
+          done = true; settled = true;
+          // Clean up the Telegram side if the TUI won.
+          const entry = pending.get(id);
+          if (entry) { clearTimeout(entry.timer); pending.delete(id); }
+          // Edit the Telegram message to reflect the TUI decision.
+          if (tgHandle) {
+            void edit(tgHandle, d === "allow" ? "✅ Approved (TUI)" : "❌ Denied (TUI)");
+          }
+          resolve(d);
+        };
+        tgPromise.then(finish);
+        tuiPromise.then(finish);
+        // If both surfaces are unavailable (no Telegram + no UI), deny fail-closed.
+        Promise.all([tgPromise, tuiPromise]).then(([tg, tui]) => {
+          if (tg === null && tui === null && !done) {
+            done = true; settled = true;
+            resolve("deny");
+          }
+        });
+      });
+
       if (decision === "deny") {
-        return { block: true, reason: "Denied via Telegram" };
+        return { block: true, reason: "Denied (Telegram/TUI approval)" };
       }
       // Allow — let the tool proceed.
     });
