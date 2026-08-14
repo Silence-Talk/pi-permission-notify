@@ -1,0 +1,21 @@
+{
+  "name": "pi-permission-notify",
+  "version": "0.1.0",
+  "description": "Bridge pi permission prompts to Telegram — notify-only (default) or remote-approval via inline buttons",
+  "type": "module",
+  "license": "MIT",
+  "author": "kush <kushon19@gmail.com>",
+  "keywords": ["pi-package", "pi-extension", "pi", "telegram", "permission", "approval", "remote-approval"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Silence-Talk/pi-permission-notify.git"
+  },
+  "homepage": "https://github.com/Silence-Talk/pi-permission-notify",
+  "bugs": {
+    "url": "https://github.com/Silence-Talk/pi-permission-notify/issues"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {}
+}
