@@ -186,6 +186,9 @@ export default function piPermissionNotifyExtension(pi: ExtensionAPI): void {
       const id = shortId();
       let settled = false;
 
+      // AbortController lets us close the TUI dialog when Telegram wins.
+      const tuiController = new AbortController();
+
       // ── Surface 1: Telegram inline keyboard ──
       const tgHandle = await send(
         { text: fmtBash(command), parseMode: "markdown", replyMarkup: {
@@ -207,7 +210,13 @@ export default function piPermissionNotifyExtension(pi: ExtensionAPI): void {
           resolve("deny");
         }, APPROVAL_TIMEOUT_MS);
         pending.set(id, {
-          resolve: (d) => { if (!settled) resolve(d); },
+          resolve: (d) => {
+            if (!settled) {
+              // Close the TUI dialog since Telegram won.
+              tuiController.abort();
+              resolve(d);
+            }
+          },
           timer, handle: tgHandle,
         });
       });
@@ -215,10 +224,16 @@ export default function piPermissionNotifyExtension(pi: ExtensionAPI): void {
       // ── Surface 2: TUI confirm dialog ──
       // Shown in parallel so approval works even when Telegram isn't
       // connected yet (e.g. at bootup). Falls back gracefully if no UI.
+      // When Telegram wins the race, tuiController.abort() closes this dialog.
       const tuiPromise: Promise<"allow" | "deny" | null> = (async () => {
         if (!ctx?.hasUI || typeof ctx?.ui?.confirm !== "function") return null;
         try {
-          const ok = await ctx.ui.confirm("Bash approval required", command);
+          const ok = await ctx.ui.confirm("Bash approval required", command, {
+            signal: tuiController.signal,
+          });
+          // If the signal was aborted, Telegram won — return null so the
+          // race doesn't treat this as a user-initiated denial.
+          if (tuiController.signal.aborted) return null;
           return ok ? "allow" : "deny";
         } catch {
           return null; // dialog dismissed/cancelled — let Telegram decide
