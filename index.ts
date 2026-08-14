@@ -86,7 +86,7 @@ export default function piPermissionNotifyExtension(pi: ExtensionAPI): void {
       const current = loadConfig().remoteApproval;
       if (arg === "" || arg === "status") {
         ctx?.ui?.notify?.(
-          `pi-permission-notify: remote-approval is ${current ? "ON (Telegram buttons)" : "OFF (notify-only)"}\nUsage: /permission-notify on|off|status  (restart pi to apply)`,
+          `pi-permission-notify: remoteApproval is ${current ? "ON (TUI + Telegram buttons)" : "OFF (TUI only, no Telegram)"}\nUsage: /permission-notify on|off|status  (restart pi to apply)`,
           "info",
         );
         return;
@@ -94,7 +94,7 @@ export default function piPermissionNotifyExtension(pi: ExtensionAPI): void {
       if (arg === "on" || arg === "enable" || arg === "true") {
         saveConfig(true);
         ctx?.ui?.notify?.(
-          `pi-permission-notify: remote-approval ON ✓\nConfig saved — restart pi (or /reload) to apply.`,
+          `pi-permission-notify: remoteApproval ON ✓\nBash gated via TUI + Telegram. Config saved — restart pi (or /reload) to apply.`,
           "info",
         );
         return;
@@ -102,7 +102,7 @@ export default function piPermissionNotifyExtension(pi: ExtensionAPI): void {
       if (arg === "off" || arg === "disable" || arg === "false") {
         saveConfig(false);
         ctx?.ui?.notify?.(
-          `pi-permission-notify: remote-approval OFF ✓\nConfig saved — restart pi (or /reload) to apply.`,
+          `pi-permission-notify: remoteApproval OFF ✓\nBash gated via TUI only (no Telegram). Config saved — restart pi (or /reload) to apply.`,
           "info",
         );
         return;
@@ -175,22 +175,28 @@ export default function piPermissionNotifyExtension(pi: ExtensionAPI): void {
   };
   try { const bus: any = (pi as any).events; if (bus?.on) bus.on(PERMISSIONS_UI_PROMPT_CHANNEL, evtHandler); } catch {}
 
-  // ── Mode 2: remote-approval (opt-in) — hook tool_call for bash ──────
-  if (config.remoteApproval) {
-    pi.on("tool_call" as any, async (event: any, ctx: any) => {
-      // Only gate bash commands.
-      if (event?.toolName !== "bash") return;
-      const command: string = event?.input?.command;
-      if (!command || typeof command !== "string") return;
+  // ── Bash approval gate (always active) ──────────────────────────────
+  // The extension is the sole gate for bash (the permission system's bash
+  // rules are set to "allow" to avoid double-prompting). The TUI confirm
+  // dialog ALWAYS runs so bash is never unguarded, even when Telegram is
+  // disconnected or remoteApproval is off. When remoteApproval is on, the
+  // Telegram inline keyboard races the TUI; first to answer wins.
+  pi.on("tool_call" as any, async (event: any, ctx: any) => {
+    // Only gate bash commands.
+    if (event?.toolName !== "bash") return;
+    const command: string = event?.input?.command;
+    if (!command || typeof command !== "string") return;
 
-      const id = shortId();
-      let settled = false;
+    const id = shortId();
+    let settled = false;
 
-      // AbortController lets us close the TUI dialog when Telegram wins.
-      const tuiController = new AbortController();
+    // AbortController lets us close the TUI dialog when Telegram wins.
+    const tuiController = new AbortController();
 
-      // ── Surface 1: Telegram inline keyboard ──
-      const tgHandle = await send(
+    // ── Surface 1: Telegram inline keyboard (only when remoteApproval is on) ──
+    let tgHandle: any = null;
+    if (config.remoteApproval) {
+      tgHandle = await send(
         { text: fmtBash(command), parseMode: "markdown", replyMarkup: {
           inline_keyboard: [[
             { text: "✅ Approve", callback_data: `${NS}:approve:${id}` },
@@ -199,88 +205,90 @@ export default function piPermissionNotifyExtension(pi: ExtensionAPI): void {
         }},
         { scope: { kind: "instance" } },
       );
+    }
 
-      const tgPromise = new Promise<"allow" | "deny" | null>((resolve) => {
-        // null = no Telegram surface available (not connected / delivery failed)
-        if (!tgHandle) return resolve(null);
-        const timer = setTimeout(() => {
-          if (settled) return;
-          pending.delete(id);
-          void edit(tgHandle, "⏱️ Timed out — denied");
-          resolve("deny");
-        }, APPROVAL_TIMEOUT_MS);
-        pending.set(id, {
-          resolve: (d) => {
-            if (!settled) {
-              // Close the TUI dialog since Telegram won.
-              tuiController.abort();
-              resolve(d);
-            }
-          },
-          timer, handle: tgHandle,
-        });
-      });
-
-      // ── Surface 2: TUI confirm dialog ──
-      // Shown in parallel so approval works even when Telegram isn't
-      // connected yet (e.g. at bootup). Falls back gracefully if no UI.
-      // When Telegram wins the race, tuiController.abort() closes this dialog.
-      const tuiPromise: Promise<"allow" | "deny" | null> = (async () => {
-        if (!ctx?.hasUI || typeof ctx?.ui?.confirm !== "function") return null;
-        try {
-          const ok = await ctx.ui.confirm("Bash approval required", command, {
-            signal: tuiController.signal,
-          });
-          // If the signal was aborted, Telegram won — return null so the
-          // race doesn't treat this as a user-initiated denial.
-          if (tuiController.signal.aborted) return null;
-          return ok ? "allow" : "deny";
-        } catch {
-          return null; // dialog dismissed/cancelled — let Telegram decide
-        }
-      })();
-
-      // ── Race: first surface to answer wins ──
-      const decision = await new Promise<"allow" | "deny">((resolve) => {
-        let done = false;
-        const finish = (d: "allow" | "deny" | null) => {
-          if (done || !d) return;
-          done = true; settled = true;
-          // Clean up the Telegram side if the TUI won.
-          const entry = pending.get(id);
-          if (entry) { clearTimeout(entry.timer); pending.delete(id); }
-          // Edit the Telegram message to reflect the TUI decision.
-          if (tgHandle) {
-            void edit(tgHandle, d === "allow" ? "✅ Approved (TUI)" : "❌ Denied (TUI)");
+    const tgPromise = new Promise<"allow" | "deny" | null>((resolve) => {
+      // null = no Telegram surface (remoteApproval off, not connected, or delivery failed)
+      if (!tgHandle) return resolve(null);
+      const timer = setTimeout(() => {
+        if (settled) return;
+        pending.delete(id);
+        void edit(tgHandle, "⏱️ Timed out — denied");
+        resolve("deny");
+      }, APPROVAL_TIMEOUT_MS);
+      pending.set(id, {
+        resolve: (d) => {
+          if (!settled) {
+            // Close the TUI dialog since Telegram won.
+            tuiController.abort();
+            resolve(d);
           }
-          resolve(d);
-        };
-        tgPromise.then(finish);
-        tuiPromise.then(finish);
-        // If both surfaces are unavailable (no Telegram + no UI), deny fail-closed.
-        Promise.all([tgPromise, tuiPromise]).then(([tg, tui]) => {
-          if (tg === null && tui === null && !done) {
-            done = true; settled = true;
-            resolve("deny");
-          }
-        });
+        },
+        timer, handle: tgHandle,
       });
-
-      if (decision === "deny") {
-        return { block: true, reason: "Denied (Telegram/TUI approval)" };
-      }
-      // Allow — let the tool proceed.
     });
-  }
+
+    // ── Surface 2: TUI confirm dialog (always shown) ──
+    // This is the primary gate. It runs even when remoteApproval is off, so
+    // bash is never unguarded. When Telegram wins the race, tuiController
+    // .abort() closes this dialog automatically.
+    const tuiPromise: Promise<"allow" | "deny" | null> = (async () => {
+      if (!ctx?.hasUI || typeof ctx?.ui?.confirm !== "function") return null;
+      try {
+        const ok = await ctx.ui.confirm("Bash approval required", command, {
+          signal: tuiController.signal,
+        });
+        // If the signal was aborted, Telegram won — return null so the
+        // race doesn't treat this as a user-initiated denial.
+        if (tuiController.signal.aborted) return null;
+        return ok ? "allow" : "deny";
+      } catch {
+        return null; // dialog dismissed/cancelled — let Telegram decide
+      }
+    })();
+
+    // ── Race: first surface to answer wins ──
+    const decision = await new Promise<"allow" | "deny">((resolve) => {
+      let done = false;
+      const finish = (d: "allow" | "deny" | null) => {
+        if (done || !d) return;
+        done = true; settled = true;
+        // Clean up the Telegram side if the TUI won.
+        const entry = pending.get(id);
+        if (entry) { clearTimeout(entry.timer); pending.delete(id); }
+        // Edit the Telegram message to reflect the TUI decision.
+        if (tgHandle) {
+          void edit(tgHandle, d === "allow" ? "✅ Approved (TUI)" : "❌ Denied (TUI)");
+        }
+        resolve(d);
+      };
+      tgPromise.then(finish);
+      tuiPromise.then(finish);
+      // If both surfaces are unavailable (no Telegram + no UI), deny fail-closed.
+      Promise.all([tgPromise, tuiPromise]).then(([tg, tui]) => {
+        if (tg === null && tui === null && !done) {
+          done = true; settled = true;
+          resolve("deny");
+        }
+      });
+    });
+
+    if (decision === "deny") {
+      return { block: true, reason: "Denied (Telegram/TUI approval)" };
+    }
+    // Allow — let the tool proceed.
+  });
 
   // ── session_start: confirm load + mode ───────────────────────────────
   pi.on("session_start", async (_e: any, ctx: any) => {
     const ok = await ensure();
-    const mode = config.remoteApproval ? "remote-approval" : "notify-only";
+    const mode = config.remoteApproval
+      ? "TUI + Telegram approval"
+      : "TUI approval (Telegram off)";
     try {
       ctx?.ui?.notify?.(
-        ok ? `pi-permission-notify: ${mode} mode active ✓`
-           : `pi-permission-notify: ${mode} mode — delivery unavailable`,
+        ok ? `pi-permission-notify: ${mode} active ✓`
+           : `pi-permission-notify: ${mode} — delivery unavailable`,
         ok ? "info" : "warn",
       );
     } catch {}

@@ -1,6 +1,6 @@
 {
   "name": "pi-permission-notify",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Bridge pi permission prompts to Telegram — notify-only (default) or remote-approval via Telegram buttons + TUI dialog",
   "type": "module",
   "license": "MIT",
